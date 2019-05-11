@@ -60,5 +60,10 @@ def load_files(load_test) -> DataObject:
 
 load_files(0)
 
+TokenizeProcessor(tokenizer=None, chunksize=10000, mark_fields=False, include_bos=True, include_eos=False)
+
+NumericalizeProcessor(vocab=None, max_vocab=60000, min_freq=2)
+
 TextLMDataBunch.from_csv()
 
+pd.DataFrame
