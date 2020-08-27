@@ -3,3 +3,5 @@ data/
 .idea/
 .ipynb_checkpoints/
 
+trfm_out/
+runs/
