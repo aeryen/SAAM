@@ -6,3 +6,8 @@ data/
 trfm_out/
 runs/
 transformers/
+
+**/cache/
+**/lightning_logs/
+src/SAAM_V3_Hotel/saam_hotel_longformer/
+**/wandb/
