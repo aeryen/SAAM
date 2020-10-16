@@ -226,8 +226,8 @@ class LightningLongformerBaseline(pl.LightningModule):
         # optimizer = torch.optim.AdamW(self.parameters(), lr=self.train_config["learning_rate"])
         optimizer = transformers.AdamW(model.parameters(), lr=train_config["learning_rate"], weight_decay=0.01)
         scheduler = transformers.get_cosine_with_hard_restarts_schedule_with_warmup(optimizer,
-                                                                                    num_warmup_steps=700,
-                                                                                    num_training_steps=3000,
+                                                                                    num_warmup_steps=500,
+                                                                                    num_training_steps=2000,
                                                                                     num_cycles=1)
         schedulers = [    
         {
