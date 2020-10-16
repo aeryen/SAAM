@@ -17,7 +17,7 @@ from transformers.modeling_longformer import LongformerModel, LongformerPreTrain
 
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import WandbLogger
-
+from pytorch_lightning.callbacks import Callback, ModelCheckpoint
 
 # %%
 import wandb
@@ -50,7 +50,8 @@ class LongformerBaseline(LongformerPreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
         self.longformer = LongformerModel(config, add_pooling_layer=False)
-        self.classifier = BaselineClasHead(config, num_aspect=6, num_rating=5)
+        # self.classifier = BaselineClasHead(config, num_aspect=6, num_rating=5)
+        self.classifier = AvgClasHead(config, num_aspect=6, num_rating=5, average=True)
         self.init_weights()
 
     def forward(
@@ -84,7 +85,8 @@ class LongformerBaseline(LongformerPreTrainedModel):
             return_dict=return_dict,
         )
         sequence_output = outputs[0]
-        logits = self.classifier(sequence_output)
+        # logits = self.classifier(sequence_output)
+        logits = self.classifier(sequence_output, attention_mask)
 
         return logits
 
@@ -117,6 +119,45 @@ class BaselineClasHead(nn.Module):
         return hidden_states.view(-1, 6, 5)
 
 
+class AvgClasHead(torch.nn.Module):
+
+    def __init__(self, config, num_aspect, num_rating, average:bool=True):
+        super().__init__()
+        self.average = average
+
+        self.ln1 = nn.LayerNorm(config.hidden_size)
+        self.dp1 = nn.Dropout(0.5)
+        self.dense1 = nn.Linear(config.hidden_size, 300)
+
+        self.ln2 = nn.LayerNorm(300)
+        self.dp2 = nn.Dropout(0.4)
+        self.dense2 = nn.Linear(300, num_aspect * num_rating)
+
+    def forward(self, embedding: torch.Tensor, mask: torch.Tensor):
+        embedding = embedding * mask.unsqueeze(-1).float()
+        embedding = embedding.sum(1)
+
+        if self.average:
+            lengths = mask.long().sum(-1)
+            length_mask = (lengths > 0)
+            # Set any length 0 to 1, to avoid dividing by zero.
+            lengths = torch.max(lengths, lengths.new_ones(1))
+            # normalize by length
+            embedding = embedding / lengths.unsqueeze(-1).float()
+            # set those with 0 mask to all zeros, i think
+            embedding = embedding * (length_mask > 0).float().unsqueeze(-1)
+
+        embedding = self.ln1(embedding)
+        embedding = self.dp1(embedding)
+        embedding = self.dense1(embedding)
+
+        embedding = self.ln2(embedding)
+        embedding = self.dp2(embedding)
+        logits = self.dense2(embedding)
+
+        return logits.view(-1, 6, 5)
+
+
 # %%
 class TokenizerCollate:
     def __init__(self):
@@ -140,11 +181,11 @@ class MultiLabelCEL(nn.CrossEntropyLoss):
 class AspectACC(pl.metrics.metric.Metric):
     def __init__(self, aspect: int,
                 compute_on_step: bool = True,
-                ddp_sync_on_step: bool = False,
+                dist_sync_on_step: bool = False,
                 process_group: Optional[Any] = None,):
         super().__init__(
             compute_on_step=compute_on_step,
-            ddp_sync_on_step=ddp_sync_on_step,
+            dist_sync_on_step=dist_sync_on_step,
             process_group=process_group,)
         
         self.aspect = aspect
@@ -173,10 +214,10 @@ class LightningLongformerBaseline(pl.LightningModule):
                                                              cache_dir=self.train_config["cache_dir"],
                                                             #  gradient_checkpointing=True
                                                                )
-        for param in self.longformer.longformer.embeddings.parameters():
-            param.requires_grad = False
-        for param in self.longformer.longformer.encoder.parameters():
-            param.requires_grad = False
+        # for param in self.longformer.longformer.embeddings.parameters():
+        #     param.requires_grad = False
+        # for param in self.longformer.longformer.encoder.parameters():
+        #     param.requires_grad = False
 
         self.lossfunc = MultiLabelCEL()
         self.metrics = [AspectACC(aspect=i) for i in range(6)]
@@ -184,7 +225,17 @@ class LightningLongformerBaseline(pl.LightningModule):
     def configure_optimizers(self):
         # optimizer = torch.optim.AdamW(self.parameters(), lr=self.train_config["learning_rate"])
         optimizer = transformers.AdamW(model.parameters(), lr=train_config["learning_rate"], weight_decay=0.01)
-        return optimizer
+        scheduler = transformers.get_cosine_with_hard_restarts_schedule_with_warmup(optimizer,
+                                                                                    num_warmup_steps=700,
+                                                                                    num_training_steps=3000,
+                                                                                    num_cycles=1)
+        schedulers = [    
+        {
+         'scheduler': scheduler,
+         'interval': 'step',
+         'frequency': 1
+        }]
+        return [optimizer], schedulers
 
     def train_dataloader(self):
         self.dataset_train = ReviewDataset("../../data/hotel_balance_LengthFix1_3000per/df_train.pickle")
@@ -192,7 +243,7 @@ class LightningLongformerBaseline(pl.LightningModule):
                                         batch_size=train_config["batch_size"],
                                         collate_fn=TokenizerCollate(),
                                         num_workers=0,
-                                        pin_memory=True, drop_last=False, shuffle=False)
+                                        pin_memory=True, drop_last=False, shuffle=True)
         return self.loader_train
 
     def val_dataloader(self):
@@ -201,7 +252,7 @@ class LightningLongformerBaseline(pl.LightningModule):
                                         batch_size=train_config["batch_size"],
                                         collate_fn=TokenizerCollate(),
                                         num_workers=0,
-                                        pin_memory=True, drop_last=False, shuffle=False)
+                                        pin_memory=True, drop_last=False, shuffle=True)
         return self.loader_val
     
 #     @autocast()
@@ -219,51 +270,118 @@ class LightningLongformerBaseline(pl.LightningModule):
         self.log("train_loss", loss)
         
         return loss
-    
+
+    def on_after_backward(self):
+        if (self.trainer.batch_idx + 1) % self.trainer.accumulate_grad_batches == 0:
+            self.log("learning_rate", self.trainer.optimizers[0].param_groups[0]['lr'] )
+            with torch.no_grad():
+                if (model.longformer.longformer.embeddings.word_embeddings.weight.grad is not None):
+                    norm_value = model.longformer.longformer.embeddings.word_embeddings.weight.grad.detach().norm(2).item()
+                    # assert not np.isnan(norm_value)
+                    self.log('NORMS/embedding norm', norm_value)
+
+                for i in [0, 4, 8, 11]:
+                    if (model.longformer.longformer.encoder.layer[i].output.dense.weight.grad is not None):
+                        norm_value = model.longformer.longformer.encoder.layer[i].output.dense.weight.grad.detach().norm(2).item()
+                        # assert not np.isnan(norm_value)
+                        self.log('NORMS/encoder %d output norm' % i, norm_value)
+
+                if (self.longformer.classifier.dense1.weight.grad is not None):
+                    norm_value = self.longformer.classifier.dense1.weight.grad.detach().norm(2).item()
+                    # assert not np.isnan(norm_value)
+                    self.log("dense1_norm2", norm_value)
+
+                if (self.longformer.classifier.dense2.weight.grad is not None):
+                    norm_value = self.longformer.classifier.dense2.weight.grad.detach().norm(2).item()
+                    # assert not np.isnan(norm_value)
+                    self.log("dense2_norm2", norm_value)
+
     def validation_step(self, batch, batch_idx):
         input_ids, mask, label  = batch[0].type(torch.int64), batch[1].type(torch.int64), batch[2].type(torch.int64)
         
         loss, logits = self(input_ids=input_ids, attention_mask=mask, labels=label)
         
-        self.log('val_loss', loss, on_step=False, on_epoch=True, reduce_fx=torch.mean, prog_bar=False)
+        # self.log('val_loss', loss, on_step=False, on_epoch=True, reduce_fx=torch.mean, prog_bar=False)
         accs = [m(logits, label) for m in self.metrics]  # update metric counters
         
-        return loss
+        return {"val_loss": loss}
     
     def validation_epoch_end(self, validation_step_outputs):
+        avg_loss = torch.stack([x['val_loss'] for x in validation_step_outputs]).mean()
+        self.log("val_loss", avg_loss)
+
         for i,m in enumerate(self.metrics):
             self.log('acc'+str(i), m.compute())
 
+    def test_step(self, batch, batch_idx):
+        input_ids, mask, label  = batch[0].type(torch.int64), batch[1].type(torch.int64), batch[2].type(torch.int64)
+        
+        loss, logits = self(input_ids=input_ids, attention_mask=mask, labels=label)
+        accs = [m(logits, label) for m in self.metrics]  # update metric counters
+        
+        return loss
+
+    def on_test_epoch_end(self):
+        for i,m in enumerate(self.metrics):
+            print('acc'+str(i), m.compute())
 
 # %%
 train_config = {}
 train_config["cache_dir"] = "./cache/"
-train_config["epochs"] = 6
-train_config["batch_size"] = 6
-train_config["accumulate_grad_batches"] = 10
-train_config["gradient_clip_val"] = 1.2
+train_config["epochs"] = 15
+train_config["batch_size"] = 4
+train_config["accumulate_grad_batches"] = 15
+train_config["gradient_clip_val"] = 1.5
 train_config["learning_rate"] = 3e-5
 
 # %%
-wandb_logger = WandbLogger(name='baseline_accumu',project='saam_hotel_longformer')
+wandb_logger = WandbLogger(name='baseline_fulltrain',project='saam_hotel_longformer')
 wandb_logger.log_hyperparams(train_config)
+wandb.save('./Hotel_Transformer_Baseline.py')
+
+# %%
+# model = LightningLongformerBaseline(train_config)
+model = LightningLongformerBaseline.load_from_checkpoint("./saam_hotel_longformer/2q1t5ns9/checkpoints/epoch=10.ckpt", config=train_config)
 
 
 # %%
-model = LightningLongformerBaseline(train_config)
-
+cp_valloss = ModelCheckpoint(filepath=wandb.run.dir+'{epoch:02d}-{val_loss:.2f}', save_top_k=5, monitor='val_loss', mode='min')
+cp_acc0 = ModelCheckpoint(filepath=wandb.run.dir+'{epoch:02d}-{acc0:.2f}', save_top_k=5, monitor='acc0', mode='max')
+cp_acc3 = ModelCheckpoint(filepath=wandb.run.dir+'{epoch:02d}-{acc3:.2f}', save_top_k=1, monitor='acc3', mode='max')
 
 # %%
+pl.seed_everything(42)
+
 trainer = pl.Trainer(max_epochs=train_config["epochs"],
                      accumulate_grad_batches=train_config["accumulate_grad_batches"],
-                    #  gradient_clip_val=train_config["gradient_clip_val"],
+                     gradient_clip_val=train_config["gradient_clip_val"],
+
                      gpus=1, num_nodes=1,
+
+                     amp_backend='native',
+                     precision=16,
+
                      logger=wandb_logger,
-                     log_every_n_steps=5)
+                     log_every_n_steps=1,
+
+                     val_check_interval=0.5,
+                     limit_val_batches=500,
+
+                     checkpoint_callback=cp_acc0,
+
+                    #  resume_from_checkpoint='./saam_hotel_longformer/2q1t5ns9/checkpoints/epoch=10.ckpt'
+                     )
 
 
 # %%
 trainer.fit(model)
+
+# %%
+# model = LightningLongformerBaseline.load_from_checkpoint("./saam_hotel_longformer/2q1t5ns9/checkpoints/epoch=10.ckpt", config=train_config)
+# trainer.test(
+#                 model=model,
+#                 test_dataloaders=model.val_dataloader(),
+#                 )
 
 # %%
 
