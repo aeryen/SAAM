@@ -227,8 +227,8 @@ class LightningLongformerBaseline(pl.LightningModule):
         optimizer = transformers.AdamW(model.parameters(), lr=train_config["learning_rate"], weight_decay=0.01)
         scheduler = transformers.get_cosine_with_hard_restarts_schedule_with_warmup(optimizer,
                                                                                     num_warmup_steps=500,
-                                                                                    num_training_steps=2000,
-                                                                                    num_cycles=1)
+                                                                                    num_training_steps=1000,
+                                                                                    num_cycles=20)
         schedulers = [    
         {
          'scheduler': scheduler,
