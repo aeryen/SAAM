@@ -18,8 +18,8 @@ from transformers.modeling_longformer import LongformerModel, LongformerPreTrain
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import WandbLogger
 from pytorch_lightning.callbacks import Callback, ModelCheckpoint
+from pytorch_lightning.utilities.distributed import rank_zero_only
 
-# %%
 import wandb
 
 # %%
@@ -189,8 +189,8 @@ class AspectACC(pl.metrics.metric.Metric):
             process_group=process_group,)
         
         self.aspect = aspect
-        self.add_state("correct", default=torch.tensor(0).cuda(), dist_reduce_fx="sum")
-        self.add_state("total", default=torch.tensor(0).cuda(), dist_reduce_fx="sum")
+        self.add_state("correct", default=torch.tensor(0), dist_reduce_fx="sum")
+        self.add_state("total", default=torch.tensor(0), dist_reduce_fx="sum")
     
     def update(self, preds: torch.Tensor, target: torch.Tensor):
         preds = torch.argmax(preds, dim=2)
@@ -220,7 +220,7 @@ class LightningLongformerBaseline(pl.LightningModule):
         #     param.requires_grad = False
 
         self.lossfunc = MultiLabelCEL()
-        self.metrics = [AspectACC(aspect=i) for i in range(6)]
+        self.metrics = torch.nn.ModuleList( [AspectACC(aspect=i) for i in range(6)] )
 
     def configure_optimizers(self):
         # optimizer = torch.optim.AdamW(self.parameters(), lr=self.train_config["learning_rate"])
@@ -325,65 +325,65 @@ class LightningLongformerBaseline(pl.LightningModule):
         for i,m in enumerate(self.metrics):
             print('acc'+str(i), m.compute())
 
-# %%
-train_config = {}
-train_config["cache_dir"] = "./cache/"
-train_config["epochs"] = 15
-train_config["batch_size"] = 4
-train_config["accumulate_grad_batches"] = 15
-train_config["gradient_clip_val"] = 1.5
-train_config["learning_rate"] = 3e-5
+@rank_zero_only
+def wandb_save(wandb_logger):
+    wandb_logger.log_hyperparams(train_config)
+    wandb_logger.experiment.save('./Hotel_Transformer_Baseline.py', policy="now")
 
-# %%
-wandb_logger = WandbLogger(name='baseline_fulltrain',project='saam_hotel_longformer')
-wandb_logger.log_hyperparams(train_config)
-wandb.save('./Hotel_Transformer_Baseline.py')
+if __name__ == "__main__":
+    train_config = {}
+    train_config["cache_dir"] = "./cache/"
+    train_config["epochs"] = 15
+    train_config["batch_size"] = 4
+    train_config["accumulate_grad_batches"] = 15
+    train_config["gradient_clip_val"] = 1.5
+    train_config["learning_rate"] = 3e-5
 
-# %%
-# model = LightningLongformerBaseline(train_config)
-model = LightningLongformerBaseline.load_from_checkpoint("./saam_hotel_longformer/2q1t5ns9/checkpoints/epoch=10.ckpt", config=train_config)
+    pl.seed_everything(42)
 
+    wandb_logger = WandbLogger(name='baseline_fulltrain',project='saam_hotel_longformer')
+    wandb_save(wandb_logger)
 
-# %%
-cp_valloss = ModelCheckpoint(filepath=wandb.run.dir+'{epoch:02d}-{val_loss:.2f}', save_top_k=5, monitor='val_loss', mode='min')
-cp_acc0 = ModelCheckpoint(filepath=wandb.run.dir+'{epoch:02d}-{acc0:.2f}', save_top_k=5, monitor='acc0', mode='max')
-cp_acc3 = ModelCheckpoint(filepath=wandb.run.dir+'{epoch:02d}-{acc3:.2f}', save_top_k=1, monitor='acc3', mode='max')
+    model = LightningLongformerBaseline(train_config)
+    # model = LightningLongformerBaseline.load_from_checkpoint("./saam_hotel_longformer/2q1t5ns9/checkpoints/epoch=10.ckpt", config=train_config)
 
-# %%
-pl.seed_everything(42)
+    cp_valloss = ModelCheckpoint(
+        # filepath=wandb.run.dir+'{epoch:02d}-{val_loss:.2f}',
+                                save_top_k=5, monitor='val_loss', mode='min')
+    cp_acc0 = ModelCheckpoint(
+        # filepath=wandb.run.dir+'{epoch:02d}-{acc0:.2f}',
+                                save_top_k=5, monitor='acc0', mode='max')
+    cp_acc3 = ModelCheckpoint(
+        # filepath=wandb.run.dir+'{epoch:02d}-{acc3:.2f}',
+                                save_top_k=1, monitor='acc3', mode='max')
 
-trainer = pl.Trainer(max_epochs=train_config["epochs"],
-                     accumulate_grad_batches=train_config["accumulate_grad_batches"],
-                     gradient_clip_val=train_config["gradient_clip_val"],
+    trainer = pl.Trainer(max_epochs=train_config["epochs"],
+                        accumulate_grad_batches=train_config["accumulate_grad_batches"],
+                        gradient_clip_val=train_config["gradient_clip_val"],
 
-                     gpus=1, num_nodes=1,
+                        gpus=[1,2], num_nodes=1,
+                        distributed_backend='ddp',
 
-                     amp_backend='native',
-                     precision=16,
+                        amp_backend='native',
+                        precision=16,
 
-                     logger=wandb_logger,
-                     log_every_n_steps=1,
+                        logger=wandb_logger,
+                        log_every_n_steps=1,
 
-                     val_check_interval=0.5,
-                     limit_val_batches=500,
+                        val_check_interval=0.5,
+                        limit_val_batches=500,
 
-                     checkpoint_callback=cp_acc0,
+                        checkpoint_callback=cp_acc0,
+                        )
 
-                    #  resume_from_checkpoint='./saam_hotel_longformer/2q1t5ns9/checkpoints/epoch=10.ckpt'
-                     )
+    trainer.fit(model)
 
+    # model = LightningLongformerBaseline.load_from_checkpoint("./saam_hotel_longformer/2q1t5ns9/checkpoints/epoch=10.ckpt", config=train_config)
+    # trainer.test(
+    #                 model=model,
+    #                 test_dataloaders=model.val_dataloader(),
+    #                 )
 
-# %%
-trainer.fit(model)
-
-# %%
-# model = LightningLongformerBaseline.load_from_checkpoint("./saam_hotel_longformer/2q1t5ns9/checkpoints/epoch=10.ckpt", config=train_config)
-# trainer.test(
-#                 model=model,
-#                 test_dataloaders=model.val_dataloader(),
-#                 )
-
-# %%
 
 
 
