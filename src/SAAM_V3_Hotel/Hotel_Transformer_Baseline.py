@@ -1,4 +1,6 @@
 
+# CUDA_VISIBLE_DEVICES=1,2
+
 # %%
 import os
 from typing import Any, Optional
@@ -50,7 +52,6 @@ class LongformerBaseline(LongformerPreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
         self.longformer = LongformerModel(config, add_pooling_layer=False)
-        # self.classifier = BaselineClasHead(config, num_aspect=6, num_rating=5)
         self.classifier = AvgClasHead(config, num_aspect=6, num_rating=5, average=True)
         self.init_weights()
 
@@ -85,38 +86,21 @@ class LongformerBaseline(LongformerPreTrainedModel):
             return_dict=return_dict,
         )
         sequence_output = outputs[0]
-        # logits = self.classifier(sequence_output)
         logits = self.classifier(sequence_output, attention_mask)
 
         return logits
 
 
-class BaselineClasHead(nn.Module):
-
-    def __init__(self, config, num_aspect, num_rating):
-        super().__init__()
-        # self.ln1 = nn.LayerNorm(config.hidden_size)
-        self.dp1 = nn.Dropout(0.4)
-        self.dense1 = nn.Linear(config.hidden_size, 400)
-        
-        # self.ln2 = nn.LayerNorm(400)
-        self.dp2 = nn.Dropout(0.4)
-        self.dense2 = nn.Linear(400, num_aspect * num_rating)
-
-    def forward(self, hidden_states, **kwargs):
-        hidden_states = hidden_states[:, 0, :]  # take <s> token (equiv. to [CLS])
-        
-        # hidden_states = self.ln1(hidden_states)
-        hidden_states = self.dp1(hidden_states)
-        hidden_states = self.dense1(hidden_states)
-        
-        hidden_states = torch.tanh(hidden_states)
-        
-        # hidden_states = self.ln2(hidden_states)
-        hidden_states = self.dp2(hidden_states)
-        hidden_states = self.dense2(hidden_states)
-        
-        return hidden_states.view(-1, 6, 5)
+class BnDropLin(nn.Sequential):
+    "Module grouping `BatchNorm1d`, `Dropout` and `Linear` layers"
+    def __init__(self, n_in, n_out, bn=True, p=0., act=None):
+        layers = [nn.LayerNorm(n_in)] if bn else []
+        if p != 0: layers.append(nn.Dropout(p))
+        lin = [nn.Linear(n_in, n_out, bias=not bn)]
+        if act is not None: lin.append(act)
+        layers = layers+lin
+        super().__init__(*layers)
+        self.lin = lin
 
 
 class AvgClasHead(torch.nn.Module):
@@ -125,13 +109,8 @@ class AvgClasHead(torch.nn.Module):
         super().__init__()
         self.average = average
 
-        self.ln1 = nn.LayerNorm(config.hidden_size)
-        self.dp1 = nn.Dropout(0.5)
-        self.dense1 = nn.Linear(config.hidden_size, 300)
-
-        self.ln2 = nn.LayerNorm(300)
-        self.dp2 = nn.Dropout(0.4)
-        self.dense2 = nn.Linear(300, num_aspect * num_rating)
+        self.lbd1 = BnDropLin(n_in=config.hidden_size, n_out=256, p=0.5, act=nn.ReLU(inplace=True))
+        self.lbd2 = BnDropLin(n_in=256, n_out=num_aspect*num_rating, p=0.4, act=None)
 
     def forward(self, embedding: torch.Tensor, mask: torch.Tensor):
         embedding = embedding * mask.unsqueeze(-1).float()
@@ -147,13 +126,8 @@ class AvgClasHead(torch.nn.Module):
             # set those with 0 mask to all zeros, i think
             embedding = embedding * (length_mask > 0).float().unsqueeze(-1)
 
-        embedding = self.ln1(embedding)
-        embedding = self.dp1(embedding)
-        embedding = self.dense1(embedding)
-
-        embedding = self.ln2(embedding)
-        embedding = self.dp2(embedding)
-        logits = self.dense2(embedding)
+        embedding = self.lbd1(embedding)
+        logits    = self.lbd2(embedding)
 
         return logits.view(-1, 6, 5)
 
@@ -286,13 +260,13 @@ class LightningLongformerBaseline(pl.LightningModule):
                         # assert not np.isnan(norm_value)
                         self.log('NORMS/encoder %d output norm' % i, norm_value)
 
-                if (self.longformer.classifier.dense1.weight.grad is not None):
-                    norm_value = self.longformer.classifier.dense1.weight.grad.detach().norm(2).item()
+                if (self.longformer.classifier.lbd1[2].weight.grad is not None):
+                    norm_value = self.longformer.classifier.lbd1[2].weight.grad.detach().norm(2).item()
                     # assert not np.isnan(norm_value)
                     self.log("dense1_norm2", norm_value)
 
-                if (self.longformer.classifier.dense2.weight.grad is not None):
-                    norm_value = self.longformer.classifier.dense2.weight.grad.detach().norm(2).item()
+                if (self.longformer.classifier.lbd2[2].weight.grad is not None):
+                    norm_value = self.longformer.classifier.lbd2[2].weight.grad.detach().norm(2).item()
                     # assert not np.isnan(norm_value)
                     self.log("dense2_norm2", norm_value)
 
@@ -333,15 +307,15 @@ def wandb_save(wandb_logger):
 if __name__ == "__main__":
     train_config = {}
     train_config["cache_dir"] = "./cache/"
-    train_config["epochs"] = 15
+    train_config["epochs"] = 16
     train_config["batch_size"] = 4
-    train_config["accumulate_grad_batches"] = 15
+    train_config["accumulate_grad_batches"] = 8
     train_config["gradient_clip_val"] = 1.5
     train_config["learning_rate"] = 3e-5
 
     pl.seed_everything(42)
 
-    wandb_logger = WandbLogger(name='baseline_fulltrain',project='saam_hotel_longformer')
+    wandb_logger = WandbLogger(name='baseline_full_relu',project='saam_hotel_longformer', log_model=True)
     wandb_save(wandb_logger)
 
     model = LightningLongformerBaseline(train_config)
