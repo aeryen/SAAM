@@ -118,7 +118,7 @@ class SAAMv3CLS(nn.Module):
         self.n_asp = n_asp
         self.n_rat = n_rat
         
-        self.proj_dim = 256
+        self.proj_dim = 128
         
         self.aspect_projector = BnDropLin(n_in=config.hidden_size, n_out=self.proj_dim, p=0.5, act=nn.GELU())
         self.senti_projector = BnDropLin(n_in=config.hidden_size, n_out=self.proj_dim, p=0.5, act=nn.GELU())
@@ -395,10 +395,10 @@ if __name__ == "__main__":
     wandb_logger = WandbLogger(name='clasV3',project='saam_hotel_longformer')
     wandb_save(wandb_logger)
 
-    # model = LightningLongformerBaseline(train_config)
-    model = LightningLongformerBaseline.load_from_checkpoint(
-                                "/home/yifan/code/2019NN/src/SAAM_V3_Hotel/saam_hotel_longformer/3tjjllkh/checkpoints/epoch=14.ckpt",
-                                config=train_config)
+    model = LightningLongformerBaseline(train_config)
+    # model = LightningLongformerBaseline.load_from_checkpoint(
+                                # "/home/yifan/code/2019NN/src/SAAM_V3_Hotel/saam_hotel_longformer/3tjjllkh/checkpoints/epoch=14.ckpt",
+                                # config=train_config)
 
     cp_valloss = ModelCheckpoint(
         # filepath=wandb.run.dir+'{epoch:02d}-{val_loss:.2f}',
