@@ -13,6 +13,7 @@ os.environ['CUDA_DEVICE_ORDER'] = "PCI_BUS_ID"
 
 # %%
 from typing import Any, Optional
+import copy 
 
 import pandas as pd
 import numpy as np
@@ -24,7 +25,7 @@ from torch.utils.data import DataLoader
 
 import transformers
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
-from transformers.models.longformer.modeling_longformer import LongformerModel, LongformerPreTrainedModel
+from transformers.models.longformer.modeling_longformer import LongformerLayer, LongformerModel, LongformerPreTrainedModel
 
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import WandbLogger
@@ -47,7 +48,7 @@ class ReviewDataset(Dataset):
 
 
 # %%
-class LongformerBaseline(LongformerPreTrainedModel):
+class LongformerLfmProjCLS(LongformerPreTrainedModel):
 
     authorized_unexpected_keys = [r"pooler"]
 
@@ -70,7 +71,6 @@ class LongformerBaseline(LongformerPreTrainedModel):
         output_hidden_states=None,
         return_dict=None,
     ):
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         if global_attention_mask is None:
             global_attention_mask = torch.zeros_like(input_ids)
@@ -86,12 +86,12 @@ class LongformerBaseline(LongformerPreTrainedModel):
             inputs_embeds=inputs_embeds,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
+            return_dict=True,
         )
-        sequence_output = outputs[0]
 
-        p_index = input_ids == self.tkz.get_vocab()["xxPERIOD"]
-        results = self.classifier(sequence_output, attention_mask, p_index)
+        p_index = (input_ids == self.tkz.get_vocab()["xxPERIOD"])
+
+        results = self.classifier(outputs, p_index)
 
         return results
 
@@ -115,26 +115,28 @@ class SAAMv3CLS(nn.Module):
         print("Num Aspect: "+str(n_asp) )
         print("Num Rating: "+str(n_rat) )
         self.config = config
+        self.proj_config = copy.deepcopy(config)
+
         self.n_asp = n_asp
         self.n_rat = n_rat
         
-        self.proj_dim = 128
+        self.proj_dim = 768
+        self.proj_config.attention_window = [32]
+        self.proj_config.final_hidden_size = self.proj_dim
         
-        self.aspect_projector = BnDropLin(n_in=config.hidden_size, n_out=self.proj_dim, p=0.5, act=nn.GELU())
-        self.senti_projector = BnDropLin(n_in=config.hidden_size, n_out=self.proj_dim, p=0.5, act=nn.GELU())
+        self.aspect_projector = LongformerLayer(self.proj_config, layer_id=0)
+        self.senti_projector = LongformerLayer(self.proj_config, layer_id=0)
         
         # aspect projector, with additional 1 aspect for throw out
-        self.aspect = BnDropLin(n_in=self.proj_dim, n_out=self.n_asp+1, p=0.35, act=nn.Softmax(dim=1))
-        # self.sentiments = nn.ModuleList( [BnDropLin(n_in=self.proj_dim, n_out=self.n_rat, p=0.35, act=None)] * self.n_asp )
-        self.sentiment = BnDropLin(n_in=self.proj_dim, n_out=self.n_rat, p=0.35, act=None)
+        # self.aspect = BnDropLin(n_in=self.proj_dim, n_out=self.n_asp+1, p=0.35, act=nn.Softmax(dim=1))
+        self.aspect = BnDropLin(n_in=self.proj_dim, n_out=self.n_asp+1, p=0.5, act=nn.Sigmoid())
+        self.sentiments = nn.ModuleList( [BnDropLin(n_in=self.proj_dim, n_out=self.n_rat, p=0.5, act=None)] * self.n_asp )
 
     def average_emb(self, output, start, end):
         avg_pool = output[start:end, :].mean(dim=0)
         return avg_pool
 
-    def sentence_avgpool(self, output, mask, p_index):
-        # doc_start = mask.int().sum(dim=1)
-        
+    def sentence_avgpool(self, output, p_index):
         batch = []
         for doci in range(0,output.shape[0]):
             pi = p_index[doci,:].nonzero(as_tuple=True)[0].int()
@@ -151,19 +153,35 @@ class SAAMv3CLS(nn.Module):
 
         return batch
 
-    def forward(self, outputs, mask, p_index):
-        batch_size = outputs.shape[0]
+    def forward(self, long_outputs, p_index):
+
+        outputs = long_outputs.orig_last_hidden_state
+        extended_attention_mask = long_outputs.mask
+
+        is_index_masked = extended_attention_mask  < 0
+        is_index_global_attn = torch.zeros_like(extended_attention_mask).bool()
+        is_global_attn = False
+
+        aspect_projection = self.aspect_projector(outputs,
+                                                    attention_mask=extended_attention_mask,
+                                                    is_index_masked=is_index_masked,
+                                                    is_index_global_attn=is_index_global_attn,
+                                                    is_global_attn=is_global_attn,)
+        senti_projection  = self.senti_projector(outputs,
+                                                    attention_mask=extended_attention_mask,
+                                                    is_index_masked=is_index_masked,
+                                                    is_index_global_attn=is_index_global_attn,
+                                                    is_global_attn=is_global_attn,)
+
+        aspect_projection = aspect_projection[0]
+        senti_projection = senti_projection[0]
+
+        if long_outputs.padding_len > 0:
+            aspect_projection = aspect_projection[:, :-long_outputs.padding_len]
+            senti_projection = senti_projection[:, :-long_outputs.padding_len]
         
-        sentence_emb_flat = outputs.reshape(-1, self.config.hidden_size)  # [n_token, 768]
-        
-        aspect_projection = self.aspect_projector( sentence_emb_flat )  # [n_token, 256]
-        senti_projection  = self.senti_projector( sentence_emb_flat )   # [n_token, 256]
-        
-        aspect_projection = aspect_projection.view(batch_size, -1, self.proj_dim)  # [batch, doc_len, 256]
-        senti_projection  = senti_projection.view(batch_size, -1, self.proj_dim)
-        
-        aspect_batch = self.sentence_avgpool(aspect_projection, mask, p_index)
-        senti_batch  = self.sentence_avgpool(senti_projection, mask, p_index)
+        aspect_batch = self.sentence_avgpool(aspect_projection, p_index)
+        senti_batch  = self.sentence_avgpool(senti_projection, p_index)
         
         allsent_aspect_proj = torch.cat(aspect_batch, dim=0)        # [n_sentence, 256]
         allsent_senti_proj = torch.cat(senti_batch, dim=0)          # [n_sentence, 256]
@@ -188,7 +206,7 @@ class SAAMv3CLS(nn.Module):
 
         all_doc_emb = torch.cat( all_doc_emb, dim=0 )          # [batch, asp, 400]
         
-        result_senti = [ self.sentiment( all_doc_emb[:,aspi,:] ) for aspi in range(0,self.n_asp) ] # [batch, ra]
+        result_senti = [ self.sentiments[aspi]( all_doc_emb[:,aspi,:] ) for aspi in range(0,self.n_asp)] # [batch, ra]
         
         result = torch.stack(result_senti, dim=1)  # [batch, asp, sentiment5]
         
@@ -249,7 +267,7 @@ class LightningLongformerBaseline(pl.LightningModule):
         super().__init__()
         self.train_config = config
         self.tokenCollate = TokenizerCollate()
-        self.longformer = LongformerBaseline.from_pretrained('allenai/longformer-base-4096',
+        self.longformer = LongformerLfmProjCLS.from_pretrained('allenai/longformer-base-4096',
                                                              cache_dir=self.train_config["cache_dir"],
                                                             #  gradient_checkpointing=True,
                                                             tkz=self.tokenCollate.tkz
@@ -328,13 +346,13 @@ class LightningLongformerBaseline(pl.LightningModule):
                     # assert not np.isnan(norm_value)
                     self.log('NORMS/encoder %d output norm' % i, norm_value)
 
-            if (self.longformer.classifier.aspect_projector[2].weight.grad is not None):
-                norm_value = self.longformer.classifier.aspect_projector[2].weight.grad.detach().norm(2).item()
+            if (self.longformer.classifier.aspect_projector.output.dense.weight.grad is not None):
+                norm_value = self.longformer.classifier.aspect_projector.output.dense.weight.grad.detach().norm(2).item()
                 # assert not np.isnan(norm_value)
                 self.log("NORMS/aspect_projector", norm_value)
 
-            if (self.longformer.classifier.senti_projector[2].weight.grad is not None):
-                norm_value = self.longformer.classifier.senti_projector[2].weight.grad.detach().norm(2).item()
+            if (self.longformer.classifier.senti_projector.output.dense.weight.grad is not None):
+                norm_value = self.longformer.classifier.senti_projector.output.dense.weight.grad.detach().norm(2).item()
                 # assert not np.isnan(norm_value)
                 self.log("NORMS/senti_projector", norm_value)
 
@@ -343,10 +361,10 @@ class LightningLongformerBaseline(pl.LightningModule):
                 # assert not np.isnan(norm_value)
                 self.log("NORMS/aspect", norm_value)
 
-            if (self.longformer.classifier.sentiment[2].weight.grad is not None):
-                norm_value = self.longformer.classifier.sentiment[2].weight.grad.detach().norm(2).item()
+            if (self.longformer.classifier.sentiments[0][2].weight.grad is not None):
+                norm_value = self.longformer.classifier.sentiments[0][2].weight.grad.detach().norm(2).item()
                 # assert not np.isnan(norm_value)
-                self.log("NORMS/sentiment", norm_value)
+                self.log("NORMS/sentiments", norm_value)
 
     def validation_step(self, batch, batch_idx):
         input_ids, mask, label  = batch[0].type(torch.int64), batch[1].type(torch.int64), batch[2].type(torch.int64)
@@ -380,26 +398,27 @@ class LightningLongformerBaseline(pl.LightningModule):
 @rank_zero_only
 def wandb_save(wandb_logger):
     wandb_logger.log_hyperparams(train_config)
-    wandb_logger.experiment.save('./Hotel_Transformer_Classification.py', policy="now")
+    wandb_logger.experiment.save('./Hotel_Transformer_Classification_2LongProj.py', policy="now")
 
 if __name__ == "__main__":
     train_config = {}
     train_config["cache_dir"] = "./cache/"
     train_config["epochs"] = 15
     train_config["batch_size"] = 4
-    train_config["accumulate_grad_batches"] = 15
+    train_config["accumulate_grad_batches"] = 10
     train_config["gradient_clip_val"] = 1.0
     train_config["learning_rate"] = 3e-5
 
     pl.seed_everything(42)
 
-    wandb_logger = WandbLogger(name='clasV3_single_sentim',project='saam_hotel_longformer')
+    wandb_logger = WandbLogger(name='clasV3_longProj_aspSigm',project='saam_hotel_longformer')
     wandb_save(wandb_logger)
 
     model = LightningLongformerBaseline(train_config)
-    # model = LightningLongformerBaseline.load_from_checkpoint(
-                                # "/home/yifan/code/2019NN/src/SAAM_V3_Hotel/saam_hotel_longformer/3tjjllkh/checkpoints/epoch=14.ckpt",
-                                # config=train_config)
+
+    model = LightningLongformerBaseline.load_from_checkpoint(
+                                "./saam_hotel_longformer/14odv0tz/checkpoints/epoch=8-step=1598.ckpt",
+                                config=train_config)
 
     cp_valloss = ModelCheckpoint(
         # filepath=wandb.run.dir+'{epoch:02d}-{val_loss:.2f}',
@@ -415,9 +434,9 @@ if __name__ == "__main__":
                         accumulate_grad_batches=train_config["accumulate_grad_batches"],
                         gradient_clip_val=train_config["gradient_clip_val"],
 
-                        gpus=[5],
+                        gpus=[0,1,3],
                         num_nodes=1,
-                        # distributed_backend='ddp',
+                        distributed_backend='ddp',
 
                         amp_backend='native',
                         precision=16,
