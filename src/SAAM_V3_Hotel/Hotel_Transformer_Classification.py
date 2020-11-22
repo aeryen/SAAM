@@ -118,18 +118,22 @@ class SAAMv3CLS(nn.Module):
         self.n_asp = n_asp
         self.n_rat = n_rat
         
-        self.proj_dim = 128
+        self.asp_proj_dim = 160
+        self.senti_proj_dim = 160
         
-        self.aspect_projector = BnDropLin(n_in=config.hidden_size, n_out=self.proj_dim, p=0.5, act=nn.GELU())
-        self.senti_projector = BnDropLin(n_in=config.hidden_size, n_out=self.proj_dim, p=0.5, act=nn.GELU())
+        self.aspect_projector = BnDropLin(n_in=config.hidden_size, n_out=self.asp_proj_dim, p=0.5, act=nn.GELU())
+        self.senti_projector = BnDropLin(n_in=config.hidden_size, n_out=self.senti_proj_dim, p=0.5, act=nn.GELU())
         
         # aspect projector, with additional 1 aspect for throw out
-        self.aspect = BnDropLin(n_in=self.proj_dim, n_out=self.n_asp+1, p=0.35, act=nn.Softmax(dim=1))
-        # self.sentiments = nn.ModuleList( [BnDropLin(n_in=self.proj_dim, n_out=self.n_rat, p=0.35, act=None)] * self.n_asp )
-        self.sentiment = BnDropLin(n_in=self.proj_dim, n_out=self.n_rat, p=0.35, act=None)
+        self.aspect = BnDropLin(n_in=self.asp_proj_dim, n_out=self.n_asp+1, p=0.5, act=nn.Softmax(dim=1))
+        self.sentiments = nn.ModuleList( [BnDropLin(n_in=self.senti_proj_dim, n_out=self.n_rat, p=0.5, act=None)] * self.n_asp )
+        # self.sentiment = BnDropLin(n_in=self.senti_proj_dim, n_out=self.n_rat, p=0.5, act=None)
 
-    def average_emb(self, output, start, end):
+    def avgmax_emb(self, output, start, end):
         avg_pool = output[start:end, :].mean(dim=0)
+        # max_pool = output[start:end, :].max(dim=0)[0]
+        # x = torch.cat([max_pool, avg_pool], 0)
+        # return x
         return avg_pool
 
     def sentence_avgpool(self, output, mask, p_index):
@@ -142,10 +146,10 @@ class SAAMv3CLS(nn.Module):
             for senti in range( len(pi) ):
                 if senti==0:
                     # from start of doc to end of first sent
-                    doc.append( self.average_emb(output[doci,:,:], 0, pi[senti]) )
+                    doc.append( self.avgmax_emb(output[doci,:,:], 0, pi[senti]+1) )
                 else:
                     # from previous period to next
-                    doc.append( self.average_emb(output[doci,:,:], pi[senti-1]+1, pi[senti]) )
+                    doc.append( self.avgmax_emb(output[doci,:,:], pi[senti-1]+1, pi[senti]+1) )
                 
             batch.append( torch.stack(doc, 0) )
 
@@ -159,8 +163,8 @@ class SAAMv3CLS(nn.Module):
         aspect_projection = self.aspect_projector( sentence_emb_flat )  # [n_token, 256]
         senti_projection  = self.senti_projector( sentence_emb_flat )   # [n_token, 256]
         
-        aspect_projection = aspect_projection.view(batch_size, -1, self.proj_dim)  # [batch, doc_len, 256]
-        senti_projection  = senti_projection.view(batch_size, -1, self.proj_dim)
+        aspect_projection = aspect_projection.view(batch_size, -1, self.asp_proj_dim)  # [batch, doc_len, 256]
+        senti_projection  = senti_projection.view(batch_size, -1, self.senti_proj_dim)
         
         aspect_batch = self.sentence_avgpool(aspect_projection, mask, p_index)
         senti_batch  = self.sentence_avgpool(senti_projection, mask, p_index)
@@ -188,7 +192,7 @@ class SAAMv3CLS(nn.Module):
 
         all_doc_emb = torch.cat( all_doc_emb, dim=0 )          # [batch, asp, 400]
         
-        result_senti = [ self.sentiment( all_doc_emb[:,aspi,:] ) for aspi in range(0,self.n_asp) ] # [batch, ra]
+        result_senti = [ self.sentiments[aspi]( all_doc_emb[:,aspi,:] ) for aspi in range(0,self.n_asp) ] # [batch, ra]
         
         result = torch.stack(result_senti, dim=1)  # [batch, asp, sentiment5]
         
@@ -266,10 +270,10 @@ class LightningLongformerBaseline(pl.LightningModule):
 
     def configure_optimizers(self):
         # optimizer = torch.optim.AdamW(self.parameters(), lr=self.train_config["learning_rate"])
-        optimizer = transformers.AdamW(model.parameters(), lr=train_config["learning_rate"], weight_decay=0.01)
+        optimizer = transformers.AdamW(model.parameters(), lr=train_config["learning_rate"], weight_decay=0.02)
         scheduler = transformers.get_cosine_with_hard_restarts_schedule_with_warmup(optimizer,
-                                                                                    num_warmup_steps=500,
-                                                                                    num_training_steps=4000,
+                                                                                    num_warmup_steps=350,
+                                                                                    num_training_steps=3000,
                                                                                     num_cycles=1)
         schedulers = [    
         {
@@ -343,10 +347,10 @@ class LightningLongformerBaseline(pl.LightningModule):
                 # assert not np.isnan(norm_value)
                 self.log("NORMS/aspect", norm_value)
 
-            if (self.longformer.classifier.sentiment[2].weight.grad is not None):
-                norm_value = self.longformer.classifier.sentiment[2].weight.grad.detach().norm(2).item()
+            if (self.longformer.classifier.sentiments[0][2].weight.grad is not None):
+                norm_value = self.longformer.classifier.sentiments[0][2].weight.grad.detach().norm(2).item()
                 # assert not np.isnan(norm_value)
-                self.log("NORMS/sentiment", norm_value)
+                self.log("NORMS/sentiments", norm_value)
 
     def validation_step(self, batch, batch_idx):
         input_ids, mask, label  = batch[0].type(torch.int64), batch[1].type(torch.int64), batch[2].type(torch.int64)
@@ -387,19 +391,20 @@ if __name__ == "__main__":
     train_config["cache_dir"] = "./cache/"
     train_config["epochs"] = 15
     train_config["batch_size"] = 4
-    train_config["accumulate_grad_batches"] = 15
+    train_config["accumulate_grad_batches"] = 10
     train_config["gradient_clip_val"] = 1.0
     train_config["learning_rate"] = 3e-5
 
     pl.seed_everything(42)
 
-    wandb_logger = WandbLogger(name='clasV3_single_sentim',project='saam_hotel_longformer')
+    wandb_logger = WandbLogger(name='clasV3_OrigMeanProj_FromScrt',project='saam_hotel_longformer')
     wandb_save(wandb_logger)
 
     model = LightningLongformerBaseline(train_config)
+
     # model = LightningLongformerBaseline.load_from_checkpoint(
-                                # "/home/yifan/code/2019NN/src/SAAM_V3_Hotel/saam_hotel_longformer/3tjjllkh/checkpoints/epoch=14.ckpt",
-                                # config=train_config)
+    #                             "/disk2/yifan/code/SAAM/src/SAAM_V3_Hotel/saam_hotel_longformer/1y4bg2wb/checkpoints/epoch=14-step=1409.ckpt",
+    #                             config=train_config)
 
     cp_valloss = ModelCheckpoint(
         # filepath=wandb.run.dir+'{epoch:02d}-{val_loss:.2f}',
@@ -415,9 +420,9 @@ if __name__ == "__main__":
                         accumulate_grad_batches=train_config["accumulate_grad_batches"],
                         gradient_clip_val=train_config["gradient_clip_val"],
 
-                        gpus=[5],
+                        gpus=[0,1,3],
                         num_nodes=1,
-                        # distributed_backend='ddp',
+                        distributed_backend='ddp',
 
                         amp_backend='native',
                         precision=16,

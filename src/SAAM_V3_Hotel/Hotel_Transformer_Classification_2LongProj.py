@@ -128,8 +128,8 @@ class SAAMv3CLS(nn.Module):
         self.senti_projector = LongformerLayer(self.proj_config, layer_id=0)
         
         # aspect projector, with additional 1 aspect for throw out
-        # self.aspect = BnDropLin(n_in=self.proj_dim, n_out=self.n_asp+1, p=0.35, act=nn.Softmax(dim=1))
-        self.aspect = BnDropLin(n_in=self.proj_dim, n_out=self.n_asp+1, p=0.5, act=nn.Sigmoid())
+        self.aspect = BnDropLin(n_in=self.proj_dim, n_out=self.n_asp+1, p=0.5, act=nn.Softmax(dim=1))
+        # self.aspect = BnDropLin(n_in=self.proj_dim, n_out=self.n_asp+1, p=0.5, act=nn.Sigmoid())
         self.sentiments = nn.ModuleList( [BnDropLin(n_in=self.proj_dim, n_out=self.n_rat, p=0.5, act=None)] * self.n_asp )
 
     def average_emb(self, output, start, end):
@@ -434,9 +434,10 @@ if __name__ == "__main__":
                         accumulate_grad_batches=train_config["accumulate_grad_batches"],
                         gradient_clip_val=train_config["gradient_clip_val"],
 
-                        gpus=[0,1,3],
+                        # gpus=[0,1,3],
+                        gpus=[0],
                         num_nodes=1,
-                        distributed_backend='ddp',
+                        # distributed_backend='ddp',
 
                         amp_backend='native',
                         precision=16,
