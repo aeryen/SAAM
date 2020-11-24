@@ -10,4 +10,5 @@ transformers/
 **/cache/
 **/lightning_logs/
 src/SAAM_V3_Hotel/saam_hotel_longformer/
+src/SAAM_V3_Beer/saam_beer_longformer/
 **/wandb/

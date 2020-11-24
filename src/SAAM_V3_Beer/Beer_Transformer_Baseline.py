@@ -41,7 +41,7 @@ class ReviewDataset(Dataset):
         return len(self.df)
 
     def __getitem__(self, idx):
-        return (self.df.iloc[idx,6], self.df.iloc[idx,0:6].to_numpy().astype(np.float) )
+        return (self.df.iloc[idx,5], self.df.iloc[idx,0:5].to_numpy().astype(np.float) )
 
 
 # %%
@@ -52,7 +52,7 @@ class LongformerBaseline(LongformerPreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
         self.longformer = LongformerModel(config, add_pooling_layer=False)
-        self.classifier = AvgClasHead(config, num_aspect=6, num_rating=5, average=True)
+        self.classifier = AvgClasHead(config, num_aspect=5, num_rating=5, average=True)
         self.init_weights()
 
     def forward(
@@ -129,7 +129,7 @@ class AvgClasHead(torch.nn.Module):
         embedding = self.lbd1(embedding)
         logits    = self.lbd2(embedding)
 
-        return logits.view(-1, 6, 5)
+        return logits.view(-1, 5, 5)
 
 
 # %%
@@ -144,7 +144,7 @@ class TokenizerCollate:
         return torch.tensor(encode["input_ids"]), torch.tensor(encode["attention_mask"]), torch.tensor(targs)
     
 class MultiLabelCEL(nn.CrossEntropyLoss):
-    def forward(self, input, target, nasp=6):
+    def forward(self, input, target, nasp=5):
         target = target.long()
         loss = 0
         for i in range(nasp):
@@ -194,15 +194,15 @@ class LightningLongformerBaseline(pl.LightningModule):
         #     param.requires_grad = False
 
         self.lossfunc = MultiLabelCEL()
-        self.metrics = torch.nn.ModuleList( [AspectACC(aspect=i) for i in range(6)] )
+        self.metrics = torch.nn.ModuleList( [AspectACC(aspect=i) for i in range(5)] )
 
     def configure_optimizers(self):
         # optimizer = torch.optim.AdamW(self.parameters(), lr=self.train_config["learning_rate"])
-        optimizer = transformers.AdamW(model.parameters(), lr=self.train_config["learning_rate"]) #, weight_decay=0.01
+        optimizer = transformers.AdamW(model.parameters(), lr=train_config["learning_rate"]) #, weight_decay=0.01
         scheduler = transformers.get_cosine_with_hard_restarts_schedule_with_warmup(optimizer,
                                                                                     num_warmup_steps=350,
-                                                                                    num_training_steps=3000,
-                                                                                    num_cycles=1)
+                                                                                    num_training_steps=9000,
+                                                                                    num_cycles=2)
         schedulers = [    
         {
          'scheduler': scheduler,
@@ -212,18 +212,18 @@ class LightningLongformerBaseline(pl.LightningModule):
         return [optimizer], schedulers
 
     def train_dataloader(self):
-        self.dataset_train = ReviewDataset("../../data/hotel_balance_LengthFix1_3000per/df_train.pickle")
+        self.dataset_train = ReviewDataset("../../data/beer_100k/df_train.pickle")
         self.loader_train = DataLoader(self.dataset_train,
-                                        batch_size=self.train_config["batch_size"],
+                                        batch_size=train_config["batch_size"],
                                         collate_fn=TokenizerCollate(),
                                         num_workers=2,
                                         pin_memory=True, drop_last=False, shuffle=True)
         return self.loader_train
 
     def val_dataloader(self):
-        self.dataset_val = ReviewDataset("../../data/hotel_balance_LengthFix1_3000per/df_test.pickle")
+        self.dataset_val = ReviewDataset("../../data/beer_100k/df_test.pickle")
         self.loader_val = DataLoader(self.dataset_val,
-                                        batch_size=self.train_config["batch_size"],
+                                        batch_size=train_config["batch_size"],
                                         collate_fn=TokenizerCollate(),
                                         num_workers=2,
                                         pin_memory=True, drop_last=False, shuffle=True)
@@ -301,20 +301,20 @@ class LightningLongformerBaseline(pl.LightningModule):
 @rank_zero_only
 def wandb_save(wandb_logger):
     wandb_logger.log_hyperparams(train_config)
-    wandb_logger.experiment.save('./Hotel_Transformer_Baseline.py', policy="now")
+    wandb_logger.experiment.save('./Beer_Transformer_Baseline.py', policy="now")
 
 if __name__ == "__main__":
     train_config = {}
     train_config["cache_dir"] = "./cache/"
-    train_config["epochs"] = 16
+    train_config["epochs"] = 15
     train_config["batch_size"] = 4
     train_config["accumulate_grad_batches"] = 12
-    train_config["gradient_clip_val"] = 1.5
+    train_config["gradient_clip_val"] = 1.0
     train_config["learning_rate"] = 2e-5
 
     pl.seed_everything(42)
 
-    wandb_logger = WandbLogger(name='baseline_fromScrt',project='saam_hotel_longformer')
+    wandb_logger = WandbLogger(name='baseline_fromScrt',project='saam_beer_longformer')
     wandb_save(wandb_logger)
 
     model = LightningLongformerBaseline(train_config)
