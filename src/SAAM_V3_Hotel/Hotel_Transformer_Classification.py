@@ -55,6 +55,7 @@ class LongformerClassification(LongformerPreTrainedModel):
         self.classifier = SAAMv3CLS(config, n_asp=6, n_rat=5)
         self.init_weights()
         self.tkz = tkz
+        assert tkz is not None
 
     def forward(
         self,
@@ -117,22 +118,22 @@ class SAAMv3CLS(nn.Module):
         self.n_rat = n_rat
         
         self.asp_proj_dim = 160
-        self.senti_proj_dim = 160
+        self.senti_proj_dim = 320
         
         self.aspect_projector = BnDropLin(n_in=config.hidden_size, n_out=self.asp_proj_dim, p=0.5, act=nn.GELU())
         self.senti_projector = BnDropLin(n_in=config.hidden_size, n_out=self.senti_proj_dim, p=0.5, act=nn.GELU())
         
         # aspect projector, with additional 1 aspect for throw out
-        self.aspect = BnDropLin(n_in=self.asp_proj_dim, n_out=self.n_asp+1, p=0.5, act=nn.Softmax(dim=1))
-        self.sentiments = nn.ModuleList( [BnDropLin(n_in=self.senti_proj_dim, n_out=self.n_rat, p=0.5, act=None)] * self.n_asp )
-        # self.sentiment = BnDropLin(n_in=self.senti_proj_dim, n_out=self.n_rat, p=0.5, act=None)
+        self.aspect = BnDropLin(n_in=self.asp_proj_dim*2, n_out=self.n_asp+1, p=0.5, act=nn.Softmax(dim=1))
+        # self.sentiments = nn.ModuleList( [BnDropLin(n_in=self.senti_proj_dim, n_out=self.n_rat, p=0.5, act=None)] * self.n_asp )
+        self.sentiment = BnDropLin(n_in=self.senti_proj_dim*2, n_out=self.n_rat, p=0.5, act=None)
 
     def avgmax_emb(self, output, start, end):
         avg_pool = output[start:end, :].mean(dim=0)
-        # max_pool = output[start:end, :].max(dim=0)[0]
-        # x = torch.cat([max_pool, avg_pool], 0)
-        # return x
-        return avg_pool
+        max_pool = output[start:end, :].max(dim=0)[0]
+        x = torch.cat([max_pool, avg_pool], 0)
+        return x
+        # return avg_pool
 
     def sentence_avgpool(self, output, mask, p_index):
         # doc_start = mask.int().sum(dim=1)
@@ -190,7 +191,7 @@ class SAAMv3CLS(nn.Module):
 
         all_doc_emb = torch.cat( all_doc_emb, dim=0 )          # [batch, asp, 400]
         
-        result_senti = [ self.sentiments[aspi]( all_doc_emb[:,aspi,:] ) for aspi in range(0,self.n_asp) ] # [batch, ra]
+        result_senti = [ self.sentiment( all_doc_emb[:,aspi,:] ) for aspi in range(0,self.n_asp) ] # [batch, ra]
         
         result = torch.stack(result_senti, dim=1)  # [batch, asp, sentiment5]
         
@@ -246,7 +247,7 @@ class AspectACC(pl.metrics.metric.Metric):
 
 
 # %%
-class LightningLongformerBaseline(pl.LightningModule):
+class LightningLongformerCLS(pl.LightningModule):
     def __init__(self, config):
         super().__init__()
         self.train_config = config
@@ -298,6 +299,15 @@ class LightningLongformerBaseline(pl.LightningModule):
                                         num_workers=2,
                                         pin_memory=True, drop_last=False, shuffle=True)
         return self.loader_val
+
+    def test_dataloader(self):
+        self.dataset_test = ReviewDataset("../../data/hotel_balance_LengthFix1_3000per/df_test.pickle")
+        self.loader_test = DataLoader(self.dataset_test,
+                                        batch_size=self.train_config["batch_size"],
+                                        collate_fn=self.tokenCollate,
+                                        num_workers=0,
+                                        pin_memory=True, drop_last=False, shuffle=False)
+        return self.loader_test
     
 #     @autocast()
     def forward(self, input_ids, attention_mask, labels):
@@ -320,33 +330,27 @@ class LightningLongformerBaseline(pl.LightningModule):
         with torch.no_grad():
             if (model.longformer.longformer.embeddings.word_embeddings.weight.grad is not None):
                 norm_value = model.longformer.longformer.embeddings.word_embeddings.weight.grad.detach().norm(2).item()
-                # assert not np.isnan(norm_value)
                 self.log('NORMS/embedding norm', norm_value)
 
             for i in [0, 4, 8, 11]:
                 if (model.longformer.longformer.encoder.layer[i].output.dense.weight.grad is not None):
                     norm_value = model.longformer.longformer.encoder.layer[i].output.dense.weight.grad.detach().norm(2).item()
-                    # assert not np.isnan(norm_value)
                     self.log('NORMS/encoder %d output norm' % i, norm_value)
 
             if (self.longformer.classifier.aspect_projector[2].weight.grad is not None):
                 norm_value = self.longformer.classifier.aspect_projector[2].weight.grad.detach().norm(2).item()
-                # assert not np.isnan(norm_value)
                 self.log("NORMS/aspect_projector", norm_value)
 
             if (self.longformer.classifier.senti_projector[2].weight.grad is not None):
                 norm_value = self.longformer.classifier.senti_projector[2].weight.grad.detach().norm(2).item()
-                # assert not np.isnan(norm_value)
                 self.log("NORMS/senti_projector", norm_value)
 
             if (self.longformer.classifier.aspect[2].weight.grad is not None):
                 norm_value = self.longformer.classifier.aspect[2].weight.grad.detach().norm(2).item()
-                # assert not np.isnan(norm_value)
                 self.log("NORMS/aspect", norm_value)
 
-            if (self.longformer.classifier.sentiments[0][2].weight.grad is not None):
-                norm_value = self.longformer.classifier.sentiments[0][2].weight.grad.detach().norm(2).item()
-                # assert not np.isnan(norm_value)
+            if (self.longformer.classifier.sentiment[2].weight.grad is not None):
+                norm_value = self.longformer.classifier.sentiment[2].weight.grad.detach().norm(2).item()
                 self.log("NORMS/sentiments", norm_value)
 
     def validation_step(self, batch, batch_idx):
@@ -377,6 +381,7 @@ class LightningLongformerBaseline(pl.LightningModule):
         accs = [m(logits, label) for m in self.metrics]  # update metric counters
 
         self.test_logit_outputs.append(logits)
+        self.test_aspect_outputs.extend(aspect_doc)
         
         return loss
 
@@ -403,9 +408,9 @@ if __name__ == "__main__":
     wandb_logger = WandbLogger(name='clasV3_MeanProj_highWD_FromScrt',project='saam_hotel_longformer')
     wandb_save(wandb_logger)
 
-    model = LightningLongformerBaseline(train_config)
+    model = LightningLongformerCLS(train_config)
 
-    # model = LightningLongformerBaseline.load_from_checkpoint(
+    # model = LightningLongformerCLS.load_from_checkpoint(
     #                             "/disk2/yifan/code/SAAM/src/SAAM_V3_Hotel/saam_hotel_longformer/1y4bg2wb/checkpoints/epoch=14-step=1409.ckpt",
     #                             config=train_config)
 
@@ -441,7 +446,7 @@ if __name__ == "__main__":
 
     trainer.fit(model)
 
-    # model = LightningLongformerBaseline.load_from_checkpoint("./src/SAAM_V3_Hotel/saam_hotel_longformer/25wkq0pm/checkpoints/epoch=10-step=857.ckpt", config=train_config)
+    # model = LightningLongformerCLS.load_from_checkpoint("./src/SAAM_V3_Hotel/saam_hotel_longformer/25wkq0pm/checkpoints/epoch=10-step=857.ckpt", config=train_config)
     # trainer.test(
     #                 model=model,
     #                 test_dataloaders=model.val_dataloader(),

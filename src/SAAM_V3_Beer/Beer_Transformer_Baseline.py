@@ -214,7 +214,7 @@ class LightningLongformerBaseline(pl.LightningModule):
     def train_dataloader(self):
         self.dataset_train = ReviewDataset("../../data/beer_100k/df_train.pickle")
         self.loader_train = DataLoader(self.dataset_train,
-                                        batch_size=train_config["batch_size"],
+                                        batch_size=self.train_config["batch_size"],
                                         collate_fn=TokenizerCollate(),
                                         num_workers=2,
                                         pin_memory=True, drop_last=False, shuffle=True)
@@ -223,11 +223,20 @@ class LightningLongformerBaseline(pl.LightningModule):
     def val_dataloader(self):
         self.dataset_val = ReviewDataset("../../data/beer_100k/df_test.pickle")
         self.loader_val = DataLoader(self.dataset_val,
-                                        batch_size=train_config["batch_size"],
+                                        batch_size=self.train_config["batch_size"],
                                         collate_fn=TokenizerCollate(),
                                         num_workers=2,
                                         pin_memory=True, drop_last=False, shuffle=True)
         return self.loader_val
+
+    def test_dataloader(self):
+        self.dataset_test = ReviewDataset("../../data/beer_100k/df_test.pickle")
+        self.loader_test = DataLoader(self.dataset_test,
+                                        batch_size=self.train_config["batch_size"],
+                                        collate_fn=TokenizerCollate(),
+                                        num_workers=2,
+                                        pin_memory=True, drop_last=False, shuffle=False)
+        return self.loader_test
     
 #     @autocast()
     def forward(self, input_ids, attention_mask, labels):
@@ -296,7 +305,7 @@ class LightningLongformerBaseline(pl.LightningModule):
 
     def on_test_epoch_end(self):
         for i,m in enumerate(self.metrics):
-            print('acc'+str(i), m.compute())
+            print('acc'+str(i), m.compute().detach().cpu())
 
 @rank_zero_only
 def wandb_save(wandb_logger):
@@ -307,7 +316,7 @@ if __name__ == "__main__":
     train_config = {}
     train_config["cache_dir"] = "./cache/"
     train_config["epochs"] = 15
-    train_config["batch_size"] = 4
+    train_config["batch_size"] = 26
     train_config["accumulate_grad_batches"] = 12
     train_config["gradient_clip_val"] = 1.0
     train_config["learning_rate"] = 2e-5
@@ -334,9 +343,9 @@ if __name__ == "__main__":
                         accumulate_grad_batches=train_config["accumulate_grad_batches"],
                         gradient_clip_val=train_config["gradient_clip_val"],
 
-                        gpus=[0,1,3],
+                        gpus=[1],
                         num_nodes=1,
-                        distributed_backend='ddp',
+                        # distributed_backend='ddp',
 
                         amp_backend='native',
                         precision=16,
